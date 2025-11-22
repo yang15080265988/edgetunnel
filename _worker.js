@@ -2,6 +2,12 @@
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
+///////////////////////////////////////////////////////stallTCP参数///////////////////////////////////////////////
+const MAX_PENDING = 2 * 1024 * 1024; // 最大待发送数据缓冲大小（2MB）
+const KEEPALIVE = 15000; // 保活时间间隔（15秒）
+const STALL_TO = 8000; // 数据停滞超时时间（8秒）
+const MAX_STALL = 12; // 最大停滞次数
+const MAX_RECONN = 24; // 最大重连次数
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////
 export default {
     async fetch(request, env) {
@@ -326,23 +332,286 @@ export default {
         return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
     }
 };
-///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
+///////////////////////////////////////////////////////内存缓冲池///////////////////////////////////////////////
+/**
+ * 策略：
+ * 1. 小缓冲：复用主缓冲区，避免频繁分配
+ * 2. 中等缓冲：放入回收池重复使用
+ * 3. 大缓冲：启用大模式时支持更大的缓冲
+ */
+class Pool {
+    constructor() {
+        this.buffer = new ArrayBuffer(16384); // 主缓冲区 16KB
+        this.pointer = 0; // 当前写入位置
+        this.pool = []; // 回收的缓冲数组
+        this.max = 8; // 最多保留 8 个缓冲
+        this.large = false; // 是否启用大缓冲模式
+    }
+
+    /**
+     * 分配缓冲区
+     * @param {number} size - 所需大小
+     * @returns {Uint8Array} 缓冲区视图
+     */
+    alloc = size => {
+        // 优先使用主缓冲区的剩余空间（减少分配）
+        if (size <= 4096 && size <= 16384 - this.pointer) {
+            const view = new Uint8Array(this.buffer, this.pointer, size);
+            this.pointer += size;
+            return view;
+        }
+
+        // 尝试从回收池获取
+        const recycled = this.pool.pop();
+        if (recycled && recycled.byteLength >= size) {
+            return new Uint8Array(recycled.buffer, 0, size);
+        }
+
+        // 新分配
+        return new Uint8Array(size);
+    };
+
+    /**
+     * 释放缓冲区，加入回收池
+     * @param {Uint8Array} buffer - 要释放的缓冲区
+     */
+    free = buffer => {
+        // 主缓冲区的一部分，回滚指针
+        if (buffer.buffer === this.buffer) {
+            this.pointer = Math.max(0, this.pointer - buffer.length);
+            return;
+        }
+        // 其他缓冲放入回收池
+        if (this.pool.length < this.max && buffer.byteLength >= 1024) {
+            this.pool.push(buffer);
+        }
+    };
+
+    /**
+     * 启用大缓冲模式（用于高吞吐量场景）
+     */
+    enableLarge = () => {
+        this.large = true;
+    };
+
+    /**
+     * 重置缓冲池状态
+     */
+    reset = () => {
+        this.pointer = 0;
+        this.pool.length = 0;
+        this.large = false;
+    };
+}
+///////////////////////////////////////////////////////////////////////WS传输数据（增强版，集成 stallTCP 优化）///////////////////////////////////////////////
 async function 处理WS请求(request, yourUUID) {
     const wssPair = new WebSocketPair();
     const [clientSock, serverSock] = Object.values(wssPair);
     serverSock.accept();
-    let remoteConnWrapper = { socket: null };
+
+    // ============ 连接状态管理（集成自 stallTCP）============
+    const pool = new Pool(); // 内存缓冲池
+    let remoteConnWrapper = { socket: null, writer: null, reader: null };
     let isDnsQuery = false;
+    let 判断是否是木马 = null;
+
+    // ============ 性能监控和统计（来自 stallTCP）============
+    let stallCount = 0; // 数据停滞次数
+    let reconnectCount = 0; // 重连次数
+    let lastActivity = Date.now(); // 最后活动时间
+    let isConnecting = false; // 是否正在连接
+    let isReading = false; // 是否正在读取
+    let connectionScore = 1.0; // 连接质量评分 (0.1-1.0)
+
+    // ============ 数据缓冲队列（来自 stallTCP）============
+    const pendingBuffers = []; // 待发送的缓冲区队列
+    let pendingBytes = 0; // 待发送字节数
+
+    // ============ 定时器管理（来自 stallTCP）============
+    const timers = {}; // 存储定时器 ID
+
+    // ============ 统计信息（来自 stallTCP）============
+    let statistics = {
+        total: 0, // 总数据块数
+        count: 0, // 统计周期内的块数
+        big: 0, // 大块数据计数
+        window: 0, // 时间窗口内的吞吐量
+        timestamp: Date.now() // 统计时间戳
+    };
+
+    // ============ 传输模式（来自 stallTCP）============
+    let transmissionMode = 'adaptive'; // 自适应模式：'adaptive' | 'buffered' | 'direct'
+    let averageSize = 0; // 平均数据块大小
+    let throughputs = []; // 吞吐量历史（最近5个数据点）
+
+    // ============ 连接信息 ============
+    let connectionInfo = null; // { host, port, respHeader }
+
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
-    let 判断是否是木马 = null;
+
+    /**
+     * 清理套接字资源（来自 stallTCP）
+     */
+    const cleanSocket = () => {
+        isReading = false;
+        try {
+            remoteConnWrapper.socket?.close();
+        } catch { }
+    };
+
+    /**
+     * 完全清理资源（来自 stallTCP）
+     */
+    const cleanup = () => {
+        Object.values(timers).forEach(clearInterval);
+        cleanSocket();
+        while (pendingBuffers.length) pool.free(pendingBuffers.shift());
+        pendingBytes = 0;
+        statistics = { total: 0, count: 0, big: 0, window: 0, timestamp: Date.now() };
+        transmissionMode = 'adaptive';
+        averageSize = 0;
+        throughputs = [];
+        pool.reset();
+    };
+
+    /**
+     * 启动健康检查定时器（来自 stallTCP）
+     */
+    const startTimers = () => {
+        // 保活心跳
+        timers.keepAlive = setInterval(async () => {
+            if (!isConnecting && remoteConnWrapper.socket && Date.now() - lastActivity > KEEPALIVE) {
+                try {
+                    const writer = remoteConnWrapper.socket.writable.getWriter();
+                    await writer.write(new Uint8Array(0));
+                    writer.releaseLock();
+                    lastActivity = Date.now();
+                } catch (error) {
+                    reconnect();
+                }
+            }
+        }, KEEPALIVE / 3);
+
+        // 健康检查
+        timers.healthCheck = setInterval(() => {
+            if (!isConnecting && statistics.total > 0 && Date.now() - lastActivity > STALL_TO) {
+                stallCount++;
+                if (stallCount >= MAX_STALL) {
+                    if (reconnectCount < MAX_RECONN) {
+                        stallCount = 0;
+                        reconnect();
+                    } else {
+                        cleanup();
+                        closeSocketQuietly(serverSock);
+                    }
+                }
+            }
+        }, STALL_TO / 2);
+    };
+
+    /**
+     * 重新连接处理（来自 stallTCP）
+     */
+    const reconnect = async () => {
+        if (!connectionInfo || serverSock.readyState !== WebSocket.OPEN) {
+            cleanup();
+            closeSocketQuietly(serverSock);
+            return;
+        }
+
+        if (reconnectCount >= MAX_RECONN) {
+            cleanup();
+            closeSocketQuietly(serverSock);
+            return;
+        }
+
+        if (isConnecting) return;
+
+        reconnectCount++;
+        let delay = Math.min(50 * Math.pow(1.5, reconnectCount - 1), 3000);
+        delay *= (1.5 - connectionScore * 0.5);
+        delay += (Math.random() - 0.5) * delay * 0.2;
+        delay = Math.max(50, Math.floor(delay));
+
+        try {
+            cleanSocket();
+
+            if (pendingBytes > MAX_PENDING * 2) {
+                while (pendingBytes > MAX_PENDING && pendingBuffers.length > 5) {
+                    const drop = pendingBuffers.shift();
+                    pendingBytes -= drop.length;
+                    pool.free(drop);
+                }
+            }
+
+            await new Promise(resolve => setTimeout(resolve, delay));
+            isConnecting = true;
+
+            // 重新建立连接
+            await forwardataTCP(
+                connectionInfo.host,
+                connectionInfo.port,
+                new Uint8Array(0),
+                serverSock,
+                connectionInfo.respHeader,
+                remoteConnWrapper,
+                true // 表示这是重连
+            );
+
+            isConnecting = false;
+            reconnectCount = 0;
+            connectionScore = Math.min(1.0, connectionScore + 0.15);
+            stallCount = 0;
+            lastActivity = Date.now();
+
+        } catch (error) {
+            isConnecting = false;
+            connectionScore = Math.max(0.1, connectionScore - 0.2);
+
+            if (reconnectCount < MAX_RECONN && serverSock.readyState === WebSocket.OPEN) {
+                setTimeout(reconnect, 500);
+            } else {
+                cleanup();
+                closeSocketQuietly(serverSock);
+            }
+        }
+    };
+
     readable.pipeTo(new WritableStream({
         async write(chunk) {
             if (isDnsQuery) return await forwardataudp(chunk, serverSock, null);
+
+            // 如果已有远程连接，直接写入
             if (remoteConnWrapper.socket) {
+                lastActivity = Date.now();
+
                 const writer = remoteConnWrapper.socket.writable.getWriter();
-                await writer.write(chunk);
-                writer.releaseLock();
+                try {
+                    // 如果有待发送缓冲，先发送队列中的数据
+                    if (pendingBuffers.length > 0) {
+                        const batchToSend = pendingBuffers.splice(0, 5);
+                        for (const buffer of batchToSend) {
+                            await writer.write(buffer);
+                            pendingBytes -= buffer.length;
+                            pool.free(buffer);
+                        }
+                    }
+
+                    // 写入当前数据
+                    await writer.write(chunk);
+                    writer.releaseLock();
+                } catch (error) {
+                    try { writer.releaseLock(); } catch (e) { }
+                    // 写入失败，放入缓冲队列
+                    if (pendingBytes < MAX_PENDING) {
+                        const buf = pool.alloc(chunk.byteLength);
+                        buf.set(new Uint8Array(chunk));
+                        pendingBuffers.push(buf);
+                        pendingBytes += buf.length;
+                    }
+                    reconnect();
+                }
                 return;
             }
 
@@ -351,16 +620,20 @@ async function 处理WS请求(request, yourUUID) {
                 判断是否是木马 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a;
             }
 
-            if (remoteConnWrapper.socket) {
-                const writer = remoteConnWrapper.socket.writable.getWriter();
-                await writer.write(chunk);
-                writer.releaseLock();
-                return;
-            }
-
             if (判断是否是木马) {
                 const { port, hostname, rawClientData } = 解析木马请求(chunk, yourUUID);
                 if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
+                connectionInfo = { host: hostname, port: port, respHeader: null };
+
+                // 如果有初始数据，放入缓冲队列
+                if (rawClientData && rawClientData.length > 0) {
+                    const buf = pool.alloc(rawClientData.length);
+                    buf.set(rawClientData);
+                    pendingBuffers.push(buf);
+                    pendingBytes += buf.length;
+                }
+
+                startTimers();
                 await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper);
             } else {
                 const { port, hostname, rawIndex, version, isUDP } = 解析魏烈思请求(chunk, yourUUID);
@@ -371,13 +644,30 @@ async function 处理WS请求(request, yourUUID) {
                 }
                 const respHeader = new Uint8Array([version[0], 0]);
                 const rawData = chunk.slice(rawIndex);
+
+                connectionInfo = { host: hostname, port: port, respHeader: respHeader };
+
                 if (isDnsQuery) return forwardataudp(rawData, serverSock, respHeader);
+
+                // 如果有初始数据，放入缓冲队列
+                if (rawData && rawData.length > 0) {
+                    const buf = pool.alloc(rawData.length);
+                    buf.set(new Uint8Array(rawData));
+                    pendingBuffers.push(buf);
+                    pendingBytes += buf.length;
+                }
+
+                startTimers();
                 await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper);
             }
         },
     })).catch((err) => {
-        // console.error('Readable pipe error:', err);
+        cleanup();
     });
+
+    // WebSocket 关闭和错误事件
+    serverSock.addEventListener('close', cleanup);
+    serverSock.addEventListener('error', cleanup);
 
     return new Response(null, { status: 101, webSocket: clientSock });
 }
@@ -476,7 +766,7 @@ function 解析魏烈思请求(chunk, token) {
     if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
     return { hasError: false, addressType, port, hostname, isUDP, rawIndex: addrValIdx + addrLen, version };
 }
-async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper) {
+async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, isReconnect = false) {
     console.log(JSON.stringify({ configJSON: { 目标地址: host, 目标端口: portNum, 反代IP: 反代IP, 代理类型: 启用SOCKS5反代, 全局代理: 启用SOCKS5全局反代, 代理账号: 我的SOCKS5账号 } }));
     async function connectDirect(address, port, data) {
         const remoteSock = connect({ hostname: address, port: port });
@@ -499,7 +789,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         }
         remoteConnWrapper.socket = newSocket;
         newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-        connectStreams(newSocket, ws, respHeader, null);
+        connectStreams(newSocket, ws, respHeader, null, remoteConnWrapper);
     }
 
     if (启用SOCKS5反代 && 启用SOCKS5全局反代) {
@@ -512,7 +802,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         try {
             const initialSocket = await connectDirect(host, portNum, rawData);
             remoteConnWrapper.socket = initialSocket;
-            connectStreams(initialSocket, ws, respHeader, connecttoPry);
+            connectStreams(initialSocket, ws, respHeader, connecttoPry, remoteConnWrapper);
         } catch (err) {
             await connecttoPry();
         }
@@ -558,28 +848,181 @@ function formatIdentifier(arr, offset = 0) {
     const hex = [...arr.slice(offset, offset + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
     return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
 }
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
+
+/**
+ * 增强版 connectStreams - 集成自适应传输模式和性能监控（来自 stallTCP）
+ */
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, remoteConnWrapper) {
     let header = headerData, hasData = false;
+    let receivedBytes = 0, lastActivity = Date.now(), lastCheck = Date.now(), lastReceivedBytes = 0;
+    let connectionScore = 1.0;
+
+    // 统计信息
+    let statistics = { total: 0, count: 0, big: 0, window: 0, timestamp: Date.now() };
+    let transmissionMode = 'adaptive';
+    let averageSize = 0;
+    let throughputs = [];
+
+    /**
+     * 更新传输模式
+     */
+    const updateMode = size => {
+        statistics.total += size;
+        statistics.count++;
+        if (size > 8192) statistics.big++;
+
+        averageSize = averageSize * 0.9 + size * 0.1;
+        const now = Date.now();
+
+        if (now - statistics.timestamp > 1000) {
+            const rate = statistics.window;
+            throughputs.push(rate);
+            if (throughputs.length > 5) throughputs.shift();
+
+            statistics.window = size;
+            statistics.timestamp = now;
+
+            const avg = throughputs.reduce((a, b) => a + b, 0) / throughputs.length;
+
+            if (statistics.count >= 20) {
+                if (avg < 8388608 || averageSize < 4096) {
+                    transmissionMode = 'buffered';
+                } else if (avg > 16777216 && averageSize > 12288) {
+                    transmissionMode = 'direct';
+                } else {
+                    transmissionMode = 'adaptive';
+                }
+            }
+        } else {
+            statistics.window += size;
+        }
+    };
+
+    let batch = [], batchSize = 0, batchTimer = null;
+
+    /**
+     * 刷新缓冲
+     */
+    const flush = () => {
+        if (!batchSize) return;
+
+        const message = new Uint8Array(batchSize);
+        let position = 0;
+
+        for (const chunk of batch) {
+            message.set(chunk, position);
+            position += chunk.length;
+        }
+
+        if (webSocket.readyState === WebSocket.OPEN) {
+            webSocket.send(message);
+        }
+
+        batch = [];
+        batchSize = 0;
+
+        if (batchTimer) {
+            clearTimeout(batchTimer);
+            batchTimer = null;
+        }
+    };
+
     await remoteSocket.readable.pipeTo(
         new WritableStream({
             async write(chunk, controller) {
                 hasData = true;
-                if (webSocket.readyState !== WebSocket.OPEN) controller.error('ws.readyState is not open');
+                if (webSocket.readyState !== WebSocket.OPEN) {
+                    controller.error('ws.readyState is not open');
+                    return;
+                }
+
+                // 更新性能指标
+                receivedBytes += chunk.byteLength;
+                lastActivity = Date.now();
+                updateMode(chunk.byteLength);
+
+                const now = Date.now();
+                if (now - lastCheck > 5000) {
+                    const elapsed = now - lastCheck;
+                    const bytes = receivedBytes - lastReceivedBytes;
+                    const throughput = bytes / elapsed;
+
+                    if (throughput > 500) {
+                        connectionScore = Math.min(1.0, connectionScore + 0.05);
+                    } else if (throughput < 50) {
+                        connectionScore = Math.max(0.1, connectionScore - 0.05);
+                    }
+
+                    lastCheck = now;
+                    lastReceivedBytes = receivedBytes;
+                }
+
+                // 处理响应头
                 if (header) {
                     const response = new Uint8Array(header.length + chunk.byteLength);
                     response.set(header, 0);
-                    response.set(chunk, header.length);
-                    webSocket.send(response.buffer);
+                    response.set(new Uint8Array(chunk), header.length);
+
+                    if (transmissionMode === 'direct' || response.length > 32768) {
+                        webSocket.send(response.buffer);
+                    } else {
+                        batch.push(response);
+                        batchSize += response.length;
+                        if (batchSize >= (transmissionMode === 'buffered' ? 131072 : 32768)) {
+                            flush();
+                        } else if (!batchTimer) {
+                            batchTimer = setTimeout(flush, transmissionMode === 'buffered' ? 20 : 15);
+                        }
+                    }
                     header = null;
-                } else {
+                    return;
+                }
+
+                // 根据传输模式处理数据
+                if (transmissionMode === 'buffered') {
+                    if (chunk.byteLength < 16384) {
+                        batch.push(new Uint8Array(chunk));
+                        batchSize += chunk.byteLength;
+
+                        if (batchSize >= 65536) {
+                            flush();
+                        } else if (!batchTimer) {
+                            batchTimer = setTimeout(flush, averageSize > 8192 ? 8 : 25);
+                        }
+                    } else {
+                        flush();
+                        webSocket.send(chunk);
+                    }
+                } else if (transmissionMode === 'direct') {
+                    flush();
                     webSocket.send(chunk);
+                } else if (transmissionMode === 'adaptive') {
+                    if (chunk.byteLength < 8192) {
+                        batch.push(new Uint8Array(chunk));
+                        batchSize += chunk.byteLength;
+
+                        if (batchSize >= 49152) {
+                            flush();
+                        } else if (!batchTimer) {
+                            batchTimer = setTimeout(flush, 12);
+                        }
+                    } else {
+                        flush();
+                        webSocket.send(chunk);
+                    }
                 }
             },
-            abort() { },
+            abort() {
+                flush();
+                if (batchTimer) clearTimeout(batchTimer);
+            },
         })
     ).catch((err) => {
+        flush();
+        if (batchTimer) clearTimeout(batchTimer);
         closeSocketQuietly(webSocket);
     });
+
     if (!hasData && retryFunc) {
         await retryFunc();
     }
